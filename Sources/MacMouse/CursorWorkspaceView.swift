@@ -15,10 +15,22 @@ struct CursorWorkspaceView: View {
         var id: Self { self }
     }
 
+    private struct ThemeRemoval {
+        enum Action {
+            case delete, clearCursors, keepOnly
+        }
+
+        let action: Action
+        let themeID: UUID
+        let title: String
+        let buttonTitle: String
+        let message: String
+    }
+
     @Bindable var store: CursorThemeStore
     @State private var selection: Selection = .role(.arrow)
     @State private var nameAction: NameAction?
-    @State private var confirmDelete = false
+    @State private var themeRemoval: ThemeRemoval?
     @State private var isDropTarget = false
 
     private var selectedRole: CursorRole? {
@@ -31,6 +43,13 @@ struct CursorWorkspaceView: View {
         case .role(let role): store.theme.asset(for: role)
         case .asset(let id): store.theme.assets.first { $0.id == id }
         }
+    }
+
+    private var isConfirmingRemoval: Binding<Bool> {
+        Binding(
+            get: { themeRemoval != nil },
+            set: { if !$0 { themeRemoval = nil } }
+        )
     }
 
     var body: some View {
@@ -71,10 +90,12 @@ struct CursorWorkspaceView: View {
             Alert(title: Text(notice.title), message: Text(notice.message),
                   dismissButton: .default(Text("好")))
         }
-        .confirmationDialog("删除「\(store.theme.name)」？", isPresented: $confirmDelete, titleVisibility: .visible) {
-            Button("删除主题", role: .destructive) { store.deleteTheme() }
-        } message: {
-            Text(store.systemThemeID == store.theme.id ? "系统会恢复 macOS 默认光标。" : "此主题中的光标文件将一同删除。")
+        .confirmationDialog(themeRemoval?.title ?? "", isPresented: isConfirmingRemoval,
+                            titleVisibility: .visible, presenting: themeRemoval) { removal in
+            Button(removal.buttonTitle, role: .destructive) { confirmThemeRemoval(removal) }
+            Button("取消", role: .cancel) {}
+        } message: { removal in
+            Text(removal.message)
         }
         .onChange(of: store.theme.id) { _, _ in
             if let role = CursorRole.allCases.first(where: { store.theme.assignments[$0] != nil }) {
@@ -112,7 +133,19 @@ struct CursorWorkspaceView: View {
                     Divider()
                     Button("新建主题…", systemImage: "plus") { nameAction = .create }
                     Button("重命名…", systemImage: "pencil") { nameAction = .rename }
-                    Button("删除主题…", systemImage: "trash", role: .destructive) { confirmDelete = true }
+                    Divider()
+                    Button("清空当前主题的光标…", systemImage: "eraser", role: .destructive) {
+                        requestThemeRemoval(.clearCursors)
+                    }
+                    .disabled(store.isImporting || !store.canClearThemeCursors)
+                    Button("只保留当前主题…", systemImage: "square.on.square", role: .destructive) {
+                        requestThemeRemoval(.keepOnly)
+                    }
+                    .disabled(store.isImporting || store.themes.count < 2)
+                    Button("删除主题…", systemImage: "trash", role: .destructive) {
+                        requestThemeRemoval(.delete)
+                    }
+                    .disabled(store.isImporting)
                 } label: {
                     Text(store.theme.name)
                         .font(.system(size: 26, weight: .semibold))
@@ -385,6 +418,51 @@ struct CursorWorkspaceView: View {
     private func deleteAsset(_ asset: CursorAsset) {
         if store.removeAsset(asset), selection == .asset(asset.id) {
             selection = .role(.arrow)
+        }
+    }
+
+    private func requestThemeRemoval(_ action: ThemeRemoval.Action) {
+        let theme = store.theme
+        let resetsCursor: Bool
+        let title: String
+        let buttonTitle: String
+        let message: String
+
+        switch action {
+        case .delete:
+            title = "删除「\(theme.name)」？"
+            buttonTitle = "删除主题"
+            message = "此主题中的光标文件将一同删除。"
+            resetsCursor = store.savedAppliedThemeID == theme.id
+        case .clearCursors:
+            title = "清空「\(theme.name)」的光标？"
+            buttonTitle = "清空光标"
+            message = "将移除 \(theme.assets.count) 个光标和所有角色分配，主题仍可继续使用。"
+            resetsCursor = store.savedAppliedThemeID == theme.id
+        case .keepOnly:
+            title = "只保留「\(theme.name)」？"
+            buttonTitle = "删除其他主题"
+            message = "将删除其他 \(store.themes.count - 1) 套主题和其中的光标。"
+            resetsCursor = store.savedAppliedThemeID.map { $0 != theme.id } ?? false
+        }
+        themeRemoval = ThemeRemoval(
+            action: action, themeID: theme.id, title: title, buttonTitle: buttonTitle,
+            message: message + (resetsCursor ? "\n系统将恢复应用该主题前的光标。" : "")
+        )
+    }
+
+    private func confirmThemeRemoval(_ removal: ThemeRemoval) {
+        guard !store.isImporting else { return }
+        switch removal.action {
+        case .delete:
+            if store.theme.id == removal.themeID { store.deleteTheme() }
+        case .clearCursors:
+            store.clearThemeCursors(removal.themeID)
+            if store.theme.id == removal.themeID, store.theme.assets.isEmpty {
+                selection = .role(.arrow)
+            }
+        case .keepOnly:
+            store.keepOnlyTheme(removal.themeID)
         }
     }
 

@@ -128,6 +128,12 @@ final class CursorThemeStore {
     var themes: [CursorTheme] { library.themes }
     var theme: CursorTheme { library.themes.first { $0.id == library.selectedID } ?? library.themes[0] }
     var isSystemAvailable: Bool { applicator.isAvailable }
+    var savedAppliedThemeID: UUID? { library.applied?.themeID }
+
+    var canClearThemeCursors: Bool {
+        let selected = theme
+        return !selected.assets.isEmpty || !selected.assignments.isEmpty || savedAppliedThemeID == selected.id
+    }
 
     var matchesAppliedTheme: Bool {
         guard let applied = library.applied, applied.themeID == theme.id else { return false }
@@ -167,12 +173,38 @@ final class CursorThemeStore {
         next.themes.removeAll { $0.id == deleted }
         if next.themes.isEmpty { next.themes = Library.empty.themes }
         next.selectedID = next.themes[0].id
-        if next.applied?.themeID == deleted {
-            next.applied = nil
-            if updateSystem(next) { reloadPreviews() }
-        } else if commit(next) {
+        if commitRemovingThemeContents(next, affectsAppliedTheme: savedAppliedThemeID == deleted) {
             reloadPreviews()
         }
+    }
+
+    func clearThemeCursors(_ id: UUID) {
+        guard !isImporting, let index = library.themes.firstIndex(where: { $0.id == id }) else { return }
+        let target = library.themes[index]
+        let wasApplied = savedAppliedThemeID == id
+        guard !target.assets.isEmpty || !target.assignments.isEmpty || wasApplied else { return }
+
+        var next = library
+        next.themes[index].assets.removeAll()
+        next.themes[index].assignments.removeAll()
+        guard commitRemovingThemeContents(next, affectsAppliedTheme: wasApplied) else { return }
+        if library.selectedID == id { decoded.removeAll() }
+        status = "已清空「\(target.name)」的光标"
+    }
+
+    func keepOnlyTheme(_ id: UUID) {
+        guard !isImporting, library.themes.count > 1,
+              let kept = library.themes.first(where: { $0.id == id }) else { return }
+        let removedCount = library.themes.count - 1
+        let selectionChanged = library.selectedID != id
+        let removesAppliedTheme = savedAppliedThemeID.map { $0 != id } ?? false
+
+        var next = library
+        next.themes = [kept]
+        next.selectedID = id
+        guard commitRemovingThemeContents(next, affectsAppliedTheme: removesAppliedTheme) else { return }
+        if selectionChanged { reloadPreviews() }
+        status = "已保留「\(kept.name)」，移除 \(removedCount) 个主题"
     }
 
     func assign(_ asset: CursorAsset, to role: CursorRole) {
@@ -371,6 +403,13 @@ final class CursorThemeStore {
             present(title: "保存主题和恢复光标均失败", error: error)
         }
         return false
+    }
+
+    private func commitRemovingThemeContents(_ next: Library, affectsAppliedTheme: Bool) -> Bool {
+        guard affectsAppliedTheme else { return commit(next) }
+        var next = next
+        next.applied = nil
+        return updateSystem(next)
     }
 
     private func setSystem(_ applied: AppliedTheme?) throws {
