@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 enum WindowsThemeImport {
@@ -6,6 +7,8 @@ enum WindowsThemeImport {
         let assignments: [CursorRole: URL]
         let reachedLimit: Bool
     }
+
+    private static let candidateLimit = 512
 
     private static let schemeOrder: [CursorRole] = [
         .arrow, .help, .working, .busy, .crosshair, .text, .handwriting, .unavailable,
@@ -52,7 +55,7 @@ enum WindowsThemeImport {
                                                   options: [.skipsHiddenFiles, .skipsPackageDescendants])
                 while let file = entries?.nextObject() as? URL {
                     inspected += 1
-                    if inspected > 6_000 || candidates.count >= 256 {
+                    if inspected > 6_000 || candidates.count >= candidateLimit {
                         reachedLimit = true
                         break
                     }
@@ -63,7 +66,7 @@ enum WindowsThemeImport {
                     }
                 }
             } else if info.isRegularFile == true {
-                if candidates.count >= 256 {
+                if candidates.count >= candidateLimit {
                     reachedLimit = true
                     break
                 }
@@ -74,7 +77,7 @@ enum WindowsThemeImport {
                                                                     includingPropertiesForKeys: Array(keys),
                                                                     options: .skipsHiddenFiles) {
                     for sibling in siblings where isCursor(sibling) {
-                        guard candidates.count < 256 else {
+                        guard candidates.count < candidateLimit else {
                             reachedLimit = true
                             break
                         }
@@ -92,16 +95,7 @@ enum WindowsThemeImport {
         let byName = Dictionary(grouping: cursors) { $0.lastPathComponent.lowercased() }
         var assignments: [CursorRole: URL] = [:]
         for inf in sorted where inf.pathExtension.lowercased() == "inf" {
-            for (role, path) in readINF(inf) where assignments[role] == nil {
-                let normalized = path.replacingOccurrences(of: "\\", with: "/").lowercased()
-                guard let name = normalized.split(separator: "/").last,
-                      let matches = byName[String(name)] else { continue }
-                let parent = inf.deletingLastPathComponent().path
-                assignments[role] = matches.max { first, second in
-                    matchScore(first, reference: normalized, parent: parent)
-                        < matchScore(second, reference: normalized, parent: parent)
-                }
-            }
+            assignments.merge(readINFAssignments(inf, cursorsByName: byName)) { existing, _ in existing }
         }
 
         let mappedFiles = Set(assignments.values)
@@ -145,12 +139,31 @@ enum WindowsThemeImport {
         return matches.max { $0.1 < $1.1 }?.0
     }
 
-    private static func readINF(_ url: URL) -> [CursorRole: String] {
+    private static func readINFAssignments(_ url: URL, cursorsByName: [String: [URL]]) -> [CursorRole: URL] {
         guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
               size <= 1_048_576,
-              let data = try? Data(contentsOf: url), data.count <= 1_048_576,
-              let source = decodeINF(data) else { return [:] }
+              let data = try? Data(contentsOf: url), data.count <= 1_048_576 else { return [:] }
 
+        let parent = url.deletingLastPathComponent().path
+        var best: [CursorRole: URL] = [:]
+        for source in decodeINF(data) {
+            let assignments = parseINF(source).compactMapValues { path -> URL? in
+                let normalized = path.replacingOccurrences(of: "\\", with: "/").lowercased()
+                guard let name = normalized.split(separator: "/").last,
+                      let matches = cursorsByName[String(name)] else { return nil }
+                return matches.max { first, second in
+                    matchScore(first, reference: normalized, parent: parent)
+                        < matchScore(second, reference: normalized, parent: parent)
+                }
+            }
+            // Both legacy encodings can decode the same bytes. Prefer the filenames that actually exist.
+            if assignments.count > best.count { best = assignments }
+            if best.count == schemeOrder.count { break }
+        }
+        return best
+    }
+
+    private static func parseINF(_ source: String) -> [CursorRole: String] {
         var strings: [String: String] = [:]
         var registry: [[String]] = []
         var section = ""
@@ -207,16 +220,24 @@ enum WindowsThemeImport {
         path.lowercased().hasSuffix(".cur") || path.lowercased().hasSuffix(".ani")
     }
 
-    private static func decodeINF(_ data: Data) -> String? {
+    private static let gb18030 = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
+        CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)
+    ))
+
+    private static func decodeINF(_ data: Data) -> [String] {
         if data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF]) {
-            return String(data: data, encoding: .utf16)
+            return String(data: data, encoding: .utf16).map { [$0] } ?? []
         }
         if data.starts(with: [0xEF, 0xBB, 0xBF]) {
-            return String(data: data.dropFirst(3), encoding: .utf8)
+            return String(data: data.dropFirst(3), encoding: .utf8).map { [$0] } ?? []
         }
-        return String(data: data, encoding: .utf8)
-            ?? String(data: data, encoding: .windowsCP1252)
-            ?? String(data: data, encoding: .isoLatin1)
+        if let source = String(data: data, encoding: .utf8) { return [source] }
+        var seen = Set<String>()
+        return [String.Encoding.windowsCP1252, gb18030, .isoLatin1].compactMap { encoding in
+            guard let source = String(data: data, encoding: encoding),
+                  seen.insert(source).inserted else { return nil }
+            return source
+        }
     }
 
     private static let tokenPattern = try! NSRegularExpression(pattern: "%([^%]+)%")

@@ -90,9 +90,9 @@ final class CursorThemeStore {
         var errors: [String] = []
     }
 
-    nonisolated private static let themeAssetLimit = 96
-    nonisolated private static let themeByteLimit = 48 * 1024 * 1024
-    nonisolated private static let themePixelLimit = 32 * 1024 * 1024
+    nonisolated private static let themeAssetLimit = 256
+    nonisolated private static let themeByteLimit = 256 * 1024 * 1024
+    nonisolated private static let themePixelLimit = 64 * 1024 * 1024
     nonisolated private static let fileByteLimit = 32 * 1024 * 1024
     private let applicator = CursorApplicator()
     private let libraryURL: URL
@@ -307,10 +307,12 @@ final class CursorThemeStore {
                 loaded[existing.id] = entry.cursor
                 continue
             }
-            guard bytes + asset.data.count <= Self.themeByteLimit,
-                  pixels + asset.decodedPixelCount <= Self.themePixelLimit,
-                  theme.assets.count < Self.themeAssetLimit else {
-                errors.append("\(asset.name) · 主题库容量已满")
+            if let reason = Self.themeCapacityExceeded(
+                count: theme.assets.count + 1,
+                bytes: bytes + asset.data.count,
+                pixels: pixels + asset.decodedPixelCount
+            ) {
+                errors.append("\(asset.name) · 当前主题\(reason)")
                 continue
             }
             bytes += asset.data.count
@@ -480,16 +482,20 @@ final class CursorThemeStore {
         var totalPixels = 0
 
         for url in files.cursors {
-            if entries.count >= themeAssetLimit || totalBytes >= themeByteLimit || totalPixels >= themePixelLimit {
-                errors.append("已达到单次导入上限。")
+            if entries.count >= themeAssetLimit {
+                errors.append("单次导入最多包含 \(themeAssetLimit) 个光标。")
                 break
             }
             do {
                 let data = try readImportFile(url, limit: fileByteLimit)
                 let cursor = try WindowsCursorParser.parse(data)
                 let pixels = decodedPixelCount(of: cursor)
-                guard totalBytes + data.count <= themeByteLimit,
-                      totalPixels + pixels <= themePixelLimit else { throw StoreError.batchLimit }
+                if let reason = themeCapacityExceeded(
+                    count: entries.count + 1, bytes: totalBytes + data.count, pixels: totalPixels + pixels
+                ) {
+                    errors.append("\(url.lastPathComponent) · 本次导入\(reason)")
+                    continue
+                }
                 let asset = CursorAsset(name: url.lastPathComponent, data: data, decodedPixelCount: pixels)
                 entries.append(ImportedCursor(url: url, asset: asset, cursor: cursor))
                 totalBytes += data.count
@@ -499,6 +505,13 @@ final class CursorThemeStore {
             }
         }
         return ImportBatch(entries: entries, assignments: files.assignments, errors: errors)
+    }
+
+    nonisolated private static func themeCapacityExceeded(count: Int, bytes: Int, pixels: Int) -> String? {
+        if count > themeAssetLimit { return "超过 \(themeAssetLimit) 个光标的上限。" }
+        if bytes > themeByteLimit { return "超过 \(themeByteLimit / (1024 * 1024)) MiB 的文件总大小上限。" }
+        if pixels > themePixelLimit { return "超过 \(themePixelLimit / (1024 * 1024)) Mi 像素的动画和图像上限。" }
+        return nil
     }
 
     nonisolated private static func loadMousecapeTheme(_ url: URL) throws -> ImportedTheme {
@@ -577,14 +590,12 @@ final class CursorThemeStore {
     private enum StoreError: LocalizedError {
         case missingAsset
         case fileTooLarge(Int)
-        case batchLimit
         case emptyMousecape
 
         var errorDescription: String? {
             switch self {
             case .missingAsset: "主题中的光标文件丢失。"
             case .fileTooLarge(let limit): "文件超过 \(limit / (1024 * 1024)) MB。"
-            case .batchLimit: "此文件超过单次导入的剩余容量。"
             case .emptyMousecape: "这个 Mousecape 主题没有可读取的光标。"
             }
         }
